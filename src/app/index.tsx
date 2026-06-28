@@ -67,17 +67,27 @@ export default function KasirScreen() {
   const [selectedCashier, setSelectedCashier] = useState('');
   const [shopName, setShopName] = useState('IGA BABI MELTIQ');
 
-  // Checkout states
-  const [checkoutModalVisible, setCheckoutModalVisible] = useState(false);
+  // Order modal states
+  const [orderModalVisible, setOrderModalVisible] = useState(false);
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
-  const [cashPaid, setCashPaid] = useState('');
-  const [paymentMethod, setPaymentMethod] = useState<'Tunai' | 'Transfer' | 'QRIS Gopay' | 'QRIS BPD'>('Tunai');
+  const [orderType, setOrderType] = useState<'Dine In' | 'Takeaway'>('Dine In');
   const [notes, setNotes] = useState('');
-  
-  // Post-transaction modal
-  const [receiptModalVisible, setReceiptModalVisible] = useState(false);
-  const [completedTransaction, setCompletedTransaction] = useState<Transaction | null>(null);
+
+  // Add-to-existing-order mode
+  const [addToOrderId, setAddToOrderId] = useState<string | null>(null);
+  const [addToOrderConfirmVisible, setAddToOrderConfirmVisible] = useState(false);
+  const [allOrders, setAllOrders] = useState<Transaction[]>([]);
+  const [selectOrderModalVisible, setSelectOrderModalVisible] = useState(false);
+  const [selectOrderTab, setSelectOrderTab] = useState<'pending' | 'completed'>('pending');
+  const [addPaymentStatus, setAddPaymentStatus] = useState<'paid' | 'unpaid'>('unpaid');
+  const [addPaymentMethod, setAddPaymentMethod] = useState<'Tunai' | 'Transfer' | 'QRIS Gopay' | 'QRIS BPD'>('Tunai');
+  const [addCashPaid, setAddCashPaid] = useState('');
+
+  // Post-order modal
+  const [orderDoneModalVisible, setOrderDoneModalVisible] = useState(false);
+  const [createdOrderId, setCreatedOrderId] = useState<string | null>(null);
+  const [isAddToExisting, setIsAddToExisting] = useState(false);
 
   // Mobile cart overlay state
   const [mobileCartVisible, setMobileCartVisible] = useState(false);
@@ -138,11 +148,53 @@ export default function KasirScreen() {
     }
   }, []);
 
+  const loadAllOrders = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from('transactions')
+        .select(`*, transaction_items (id, product_id, name, quantity, price, completed, payment_status)`)
+        .order('date', { ascending: false });
+
+      if (error) throw error;
+
+      if (data) {
+        const mapped: Transaction[] = data.map((tx: any) => ({
+          id: tx.id,
+          date: tx.date,
+          total: Number(tx.total),
+          cashPaid: Number(tx.cash_paid),
+          change: Number(tx.change),
+          customerName: tx.customer_name || undefined,
+          customerPhone: tx.customer_phone || undefined,
+          cashierName: tx.cashier_name || undefined,
+          paymentMethod: tx.payment_method || 'Tunai',
+          notes: tx.notes || undefined,
+          status: tx.status || 'completed',
+          orderType: tx.order_type || 'Dine In',
+          paymentStatus: tx.payment_status || 'paid',
+          items: (tx.transaction_items || []).map((item: any) => ({
+            id: item.product_id,
+            name: item.name,
+            price: Number(item.price),
+            quantity: item.quantity,
+            completed: item.completed,
+            dbId: item.id,
+            paymentStatus: tx.payment_status === 'paid' ? 'paid' : (item.payment_status || 'unpaid'),
+          })),
+        }));
+        setAllOrders(mapped);
+      }
+    } catch (e) {
+      console.error('Error loading orders:', e);
+    }
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       loadProducts();
       loadSettings();
-    }, [loadProducts, loadSettings])
+      loadAllOrders();
+    }, [loadProducts, loadSettings, loadAllOrders])
   );
 
   // Realtime subscriptions: auto-sync across devices
@@ -155,6 +207,9 @@ export default function KasirScreen() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'settings' }, () => {
         loadSettings();
       })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'transactions' }, () => {
+        loadAllOrders();
+      })
       .subscribe((status, err) => {
         console.log('Realtime (index.tsx) Status:', status, err ? err : '');
       });
@@ -162,7 +217,7 @@ export default function KasirScreen() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [loadProducts, loadSettings]);
+  }, [loadProducts, loadSettings, loadAllOrders]);
 
   // Cart operations
   const addToCart = (product: Product) => {
@@ -203,18 +258,20 @@ export default function KasirScreen() {
     return cart.reduce((sum, item) => sum + item.quantity, 0);
   };
 
-  const handleCheckoutOpen = () => {
+  const handleOrderOpen = () => {
     if (cart.length === 0) {
       Alert.alert('Keranjang Kosong', 'Silakan pilih produk terlebih dahulu');
       return;
     }
-    setCashPaid('');
-    setPaymentMethod('Tunai');
+    setOrderType('Dine In');
     setNotes('');
-    // Automatically set default cashier or first cashier if available
+    setCustomerName('');
+    setCustomerPhone('');
+
+    // Automatically set default cashier if available
     const resetCheckoutSelectedCashier = async () => {
       try {
-        const { data, error } = await supabase.from('settings').select('*').eq('key', 'default_cashier').maybeSingle();
+        const { data } = await supabase.from('settings').select('*').eq('key', 'default_cashier').maybeSingle();
         const storedDefault = data ? data.value : null;
         if (storedDefault && cashiers.includes(storedDefault)) {
           setSelectedCashier(storedDefault);
@@ -228,32 +285,157 @@ export default function KasirScreen() {
       }
     };
     resetCheckoutSelectedCashier();
-    setCheckoutModalVisible(true);
+    setAddToOrderId(null);
+    setOrderModalVisible(true);
   };
 
-  const handleProcessCheckout = async () => {
-    const total = getCartTotal();
-    const paid = paymentMethod === 'Tunai' ? parseFloat(cashPaid) : total;
-    
-    if (isNaN(paid) || paid < total) {
-      Alert.alert('Pembayaran Kurang', 'Jumlah uang bayar kurang dari total belanja');
+  // Open modal to select an existing order to add items to
+  const handleOpenAddToOrder = () => {
+    if (cart.length === 0) {
+      Alert.alert('Keranjang Kosong', 'Silakan pilih produk terlebih dahulu');
+      return;
+    }
+    if (allOrders.length === 0) {
+      Alert.alert('Tidak Ada Order', 'Belum ada order. Buat order baru terlebih dahulu.');
+      return;
+    }
+    setSelectOrderTab('pending');
+    setSelectOrderModalVisible(true);
+  };
+
+  const handleSelectExistingOrder = (orderId: string) => {
+    setAddToOrderId(orderId);
+    setAddPaymentStatus('unpaid');
+    setSelectOrderModalVisible(false);
+    setAddToOrderConfirmVisible(true);
+  };
+
+  // Add cart items to an existing order
+  const handleAddItemsToExistingOrder = async () => {
+    if (!addToOrderId) return;
+    const targetOrder = allOrders.find(o => o.id === addToOrderId);
+    if (!targetOrder) return;
+
+    const addedTotal = getCartTotal();
+    let paidForAddition = 0;
+    let changeForAddition = 0;
+
+    if (addPaymentStatus === 'paid') {
+      if (addPaymentMethod === 'Tunai') {
+        const cashInput = parseFloat(addCashPaid);
+        if (isNaN(cashInput) || cashInput < addedTotal) {
+          Alert.alert('Pembayaran Kurang', `Jumlah uang bayar kurang dari total tambahan ${formatRupiah(addedTotal)}.`);
+          return;
+        }
+        paidForAddition = cashInput;
+        changeForAddition = cashInput - addedTotal;
+      } else {
+        paidForAddition = addedTotal;
+        changeForAddition = 0;
+      }
+    }
+
+    try {
+      if ((targetOrder.paymentStatus || 'paid') === 'paid') {
+        // Fix for legacy data: if the order was already paid, ensure its existing items
+        // are explicitly marked as paid in the database before inserting new items.
+        await supabase
+          .from('transaction_items')
+          .update({ payment_status: 'paid' })
+          .eq('transaction_id', addToOrderId);
+      }
+
+      const newItems = cart.map(item => ({
+        transaction_id: addToOrderId,
+        product_id: item.id,
+        name: item.note ? `${item.name} (${item.note})` : item.name,
+        quantity: item.quantity,
+        price: item.price,
+        completed: false, // Pesanan belum disajikan, maka false
+        payment_status: addPaymentStatus,
+      }));
+
+      const { error: itemsError } = await supabase.from('transaction_items').insert(newItems);
+      if (itemsError) throw itemsError;
+
+      // Recalculate total and payment
+      const newTotal = targetOrder.total + addedTotal;
+      const newCashPaid = targetOrder.cashPaid + paidForAddition;
+      const newChange = targetOrder.change + changeForAddition;
+      
+      // Jika status tambahan adalah belum bayar, maka transaksi secara keseluruhan belum lunas
+      const isFullyPaid = addPaymentStatus === 'unpaid' 
+        ? false 
+        : (newCashPaid - newChange >= newTotal);
+
+      let updateData: any = {
+        total: newTotal,
+        cash_paid: newCashPaid,
+        change: newChange,
+        payment_status: isFullyPaid ? 'paid' : 'unpaid',
+        status: 'pending',
+      };
+
+      if (addPaymentStatus === 'paid') {
+        updateData.payment_method = addPaymentMethod;
+      }
+
+      const { error: txError } = await supabase
+        .from('transactions')
+        .update(updateData)
+        .eq('id', addToOrderId);
+      if (txError) throw txError;
+
+      // Deduct stocks
+      for (const item of cart) {
+        const prod = products.find(p => p.id === item.id);
+        if (prod) {
+          const newStock = Math.max(0, prod.stock - item.quantity);
+          await supabase.from('products').update({ stock: newStock }).eq('id', prod.id);
+        }
+      }
+
+      const { data: updatedProducts } = await supabase.from('products').select('*').order('name');
+      if (updatedProducts) setProducts(updatedProducts);
+
+      setIsAddToExisting(true);
+      setAddToOrderConfirmVisible(false);
+      setCreatedOrderId(addToOrderId);
+      setCart([]);
+      setAddToOrderId(null);
+      setMobileCartVisible(false);
+      setOrderDoneModalVisible(true);
+      await loadAllOrders();
+
+    } catch (e: any) {
+      console.error('Failed to add items to existing order', e);
+      Alert.alert('Error', 'Gagal menambah pesanan ke order yang ada.');
+    }
+  };
+
+  // Create a new order (without payment)
+  const handleCreateOrder = async () => {
+    if (!customerName.trim()) {
+      Alert.alert('Nama Wajib', 'Nama pelanggan harus diisi.');
       return;
     }
 
-    const change = paymentMethod === 'Tunai' ? paid - total : 0;
+    const total = getCartTotal();
     const transaction: Transaction = {
       id: generateReceiptId(),
       date: new Date().toISOString(),
       items: cart.map(item => ({ ...item, completed: false })),
       total,
-      cashPaid: paid,
-      change,
-      customerName: customerName.trim() || undefined,
+      cashPaid: 0,
+      change: 0,
+      customerName: customerName.trim(),
       customerPhone: customerPhone.trim() || undefined,
       cashierName: selectedCashier || undefined,
-      paymentMethod,
+      paymentMethod: 'Tunai',
       notes: notes.trim() || undefined,
       status: 'pending',
+      orderType,
+      paymentStatus: 'unpaid',
     };
 
     // Save transaction to Supabase
@@ -262,14 +444,16 @@ export default function KasirScreen() {
         id: transaction.id,
         date: transaction.date,
         total: transaction.total,
-        cash_paid: transaction.cashPaid,
-        change: transaction.change,
+        cash_paid: 0,
+        change: 0,
         customer_name: transaction.customerName || null,
         customer_phone: transaction.customerPhone || null,
         cashier_name: transaction.cashierName || null,
         payment_method: transaction.paymentMethod,
         notes: transaction.notes || null,
         status: transaction.status,
+        order_type: transaction.orderType,
+        payment_status: transaction.paymentStatus,
       }]);
       if (txError) throw txError;
 
@@ -278,10 +462,11 @@ export default function KasirScreen() {
         cart.map(item => ({
           transaction_id: transaction.id,
           product_id: item.id,
-          name: item.name,
+          name: item.note ? `${item.name} (${item.note})` : item.name,
           quantity: item.quantity,
           price: item.price,
           completed: false,
+          payment_status: 'unpaid',
         }))
       );
       if (itemsError) throw itemsError;
@@ -295,58 +480,31 @@ export default function KasirScreen() {
         }
       }
 
-      // Reload products list from Supabase
+      // Reload products list
       const { data: updatedProducts } = await supabase.from('products').select('*').order('name');
       if (updatedProducts) setProducts(updatedProducts);
 
     } catch (e: any) {
-      console.error('Failed to save transaction to Supabase', e);
-      Alert.alert('Error Database', 'Gagal menyimpan transaksi ke database online.');
+      console.error('Failed to save order to Supabase', e);
+      Alert.alert('Error Database', 'Gagal menyimpan pesanan ke database online.');
       return;
     }
 
-    setCompletedTransaction(transaction);
-    setCheckoutModalVisible(false);
+    setCreatedOrderId(transaction.id);
+    setOrderModalVisible(false);
     setMobileCartVisible(false);
-    setReceiptModalVisible(true);
-  };
-
-  const resetCart = () => {
+    setOrderDoneModalVisible(true);
     setCart([]);
     setCustomerName('');
     setCustomerPhone('');
-    setCashPaid('');
     setNotes('');
-    setPaymentMethod('Tunai');
-    setReceiptModalVisible(false);
+    setOrderType('Dine In');
+    await loadAllOrders();
   };
 
-  const handlePrint = async () => {
-    if (!completedTransaction) return;
-    try {
-      const html = generateHTMLReceipt(completedTransaction, shopName);
-      await Print.printAsync({ html });
-    } catch {
-      Alert.alert('Error', 'Gagal mencetak struk');
-    }
-  };
-
-  const handleWhatsApp = () => {
-    if (!completedTransaction) return;
-    const phone = completedTransaction.customerPhone || '';
-    let cleanPhone = phone.replace(/[^0-9]/g, '');
-    
-    // Add Indonesian country code if phone starts with 0
-    if (cleanPhone.startsWith('0')) {
-      cleanPhone = '62' + cleanPhone.slice(1);
-    }
-
-    const text = formatWhatsAppReceipt(completedTransaction, shopName);
-    const url = `https://wa.me/${cleanPhone}?text=${text}`;
-
-    Linking.openURL(url).catch((err) => {
-      Alert.alert('Error', 'Gagal membuka WhatsApp. Pastikan aplikasi WhatsApp terinstal.');
-    });
+  const resetAfterOrder = () => {
+    setOrderDoneModalVisible(false);
+    setCreatedOrderId(null);
   };
 
   // Filter Catalog
@@ -508,6 +666,24 @@ export default function KasirScreen() {
               <ThemedText type="small" themeColor="textSecondary">
                 {formatRupiah(item.price)} x {item.quantity}
               </ThemedText>
+              <TextInput
+                style={{
+                  marginTop: 6,
+                  paddingVertical: 4,
+                  paddingHorizontal: 8,
+                  borderWidth: 1,
+                  borderColor: 'rgba(142, 142, 147, 0.3)',
+                  borderRadius: 6,
+                  fontSize: 12,
+                  color: theme.text,
+                }}
+                placeholder="Catatan (opsional)..."
+                placeholderTextColor={theme.textSecondary}
+                value={item.note || ''}
+                onChangeText={(text) => {
+                  setCart(prev => prev.map(c => c.id === item.id ? { ...c, note: text } : c));
+                }}
+              />
             </View>
             <View style={styles.cartCardRight}>
               <ThemedText type="smallBold" style={styles.cartSubtotal}>
@@ -563,12 +739,24 @@ export default function KasirScreen() {
             {formatRupiah(getCartTotal())}
           </ThemedText>
         </View>
+
+        {/* Add to existing order button */}
+        {allOrders.length > 0 && (
+          <Pressable
+            style={[styles.addToOrderBtn, cart.length === 0 && styles.disabledBtn]}
+            onPress={handleOpenAddToOrder}
+            disabled={cart.length === 0}
+          >
+            <ThemedText style={styles.addToOrderBtnText}>➕ Tambah ke Order</ThemedText>
+          </Pressable>
+        )}
+
         <Pressable
           style={[styles.checkoutBtn, cart.length === 0 && styles.disabledBtn]}
-          onPress={handleCheckoutOpen}
+          onPress={handleOrderOpen}
           disabled={cart.length === 0}
         >
-          <ThemedText style={styles.checkoutBtnText}>Proses Bayar</ThemedText>
+          <ThemedText style={styles.checkoutBtnText}>🧾 Buat Order Baru</ThemedText>
         </Pressable>
       </View>
     </ThemedView>
@@ -631,28 +819,310 @@ export default function KasirScreen() {
                   <ThemedText type="default">Total</ThemedText>
                   <ThemedText type="subtitle">{formatRupiah(getCartTotal())}</ThemedText>
                 </View>
-                <Pressable style={styles.checkoutBtn} onPress={handleCheckoutOpen}>
-                  <ThemedText style={styles.checkoutBtnText}>Proses Bayar</ThemedText>
+
+                {allOrders.length > 0 && (
+                  <Pressable
+                    style={styles.addToOrderBtn}
+                    onPress={handleOpenAddToOrder}
+                  >
+                    <ThemedText style={styles.addToOrderBtnText}>➕ Tambah ke Order</ThemedText>
+                  </Pressable>
+                )}
+
+                <Pressable style={styles.checkoutBtn} onPress={handleOrderOpen}>
+                  <ThemedText style={styles.checkoutBtnText}>🧾 Buat Order Baru</ThemedText>
                 </Pressable>
               </View>
             </ThemedView>
           </View>
         </Modal>
 
-        {/* Checkout & Payment Input Modal */}
+        {/* Select Existing Order Modal */}
         <Modal
           animationType="fade"
           transparent={true}
-          visible={checkoutModalVisible}
-          onRequestClose={() => setCheckoutModalVisible(false)}
+          visible={selectOrderModalVisible}
+          onRequestClose={() => setSelectOrderModalVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <ThemedView type="backgroundElement" style={styles.checkoutModalContent}>
+              {/* Header with X close */}
+              <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: Spacing.two }}>
+                <ThemedText type="smallBold" style={[styles.modalTitle, { flex: 1, marginBottom: 0 }]}>
+                  Tambah ke Order
+                </ThemedText>
+                <Pressable
+                  style={styles.closeIconBtn}
+                  onPress={() => setSelectOrderModalVisible(false)}
+                >
+                  <ThemedText style={{ fontSize: 18, fontWeight: 'bold' }}>×</ThemedText>
+                </Pressable>
+              </View>
+
+              {/* Tabs Aktif / Selesai */}
+              <View style={[styles.miniTabContainer, { backgroundColor: theme.backgroundSelected }]}>
+                <Pressable
+                  style={[
+                    styles.miniTab,
+                    selectOrderTab === 'pending' && { backgroundColor: '#FF9500', borderRadius: Spacing.two },
+                  ]}
+                  onPress={() => setSelectOrderTab('pending')}
+                >
+                  <ThemedText
+                    type="smallBold"
+                    style={{ fontSize: 13, color: selectOrderTab === 'pending' ? '#ffffff' : theme.textSecondary }}
+                  >
+                    ⏳ Aktif ({allOrders.filter(o => o.status === 'pending').length})
+                  </ThemedText>
+                </Pressable>
+                <Pressable
+                  style={[
+                    styles.miniTab,
+                    selectOrderTab === 'completed' && { backgroundColor: '#34C759', borderRadius: Spacing.two },
+                  ]}
+                  onPress={() => setSelectOrderTab('completed')}
+                >
+                  <ThemedText
+                    type="smallBold"
+                    style={{ fontSize: 13, color: selectOrderTab === 'completed' ? '#ffffff' : theme.textSecondary }}
+                  >
+                    ✓ Selesai ({allOrders.filter(o => o.status === 'completed').length})
+                  </ThemedText>
+                </Pressable>
+              </View>
+
+              <ScrollView style={{ maxHeight: 280 }} contentContainerStyle={{ gap: Spacing.two, paddingVertical: Spacing.two }}>
+                {allOrders
+                  .filter(o => o.status === selectOrderTab)
+                  .length === 0 ? (
+                  <View style={{ alignItems: 'center', paddingVertical: Spacing.four }}>
+                    <ThemedText themeColor="textSecondary" type="small">
+                      Tidak ada order {selectOrderTab === 'pending' ? 'aktif' : 'selesai'}.
+                    </ThemedText>
+                  </View>
+                ) : (
+                  allOrders
+                    .filter(o => o.status === selectOrderTab)
+                    .map((order) => {
+                      const isPaid = (order.paymentStatus || 'paid') === 'paid';
+                      return (
+                        <Pressable
+                          key={order.id}
+                          style={[styles.orderSelectItem, { borderColor: theme.backgroundSelected }]}
+                          onPress={() => handleSelectExistingOrder(order.id)}
+                        >
+                          <View style={{ flex: 1 }}>
+                            <ThemedText type="smallBold" style={{ fontSize: 14 }}>
+                              {order.customerName || 'Tanpa Nama'}
+                            </ThemedText>
+                            <ThemedText type="small" themeColor="textSecondary">
+                              {order.id} · {order.orderType || 'Dine In'} · {order.items.length} item
+                            </ThemedText>
+                            <ThemedText
+                              type="code"
+                              style={{ fontSize: 11, color: isPaid ? '#34C759' : '#FF3B30', marginTop: 2 }}
+                            >
+                              {isPaid ? '✅ Sudah Bayar' : '❌ Belum Bayar'} · {formatRupiah(order.total)}
+                            </ThemedText>
+                          </View>
+                          <ThemedText style={{ fontSize: 20, color: '#007AFF' }}>›</ThemedText>
+                        </Pressable>
+                      );
+                    })
+                )}
+              </ScrollView>
+            </ThemedView>
+          </View>
+        </Modal>
+
+        {/* Add to order confirm modal */}
+        <Modal
+          animationType="fade"
+          transparent={true}
+          visible={addToOrderConfirmVisible}
+          onRequestClose={() => setAddToOrderConfirmVisible(false)}
         >
           <View style={styles.modalOverlay}>
             <ThemedView type="backgroundElement" style={styles.checkoutModalContent}>
               <ThemedText type="smallBold" style={styles.modalTitle}>
-                Pembayaran
+                Tambah Pesanan
               </ThemedText>
 
-              <ScrollView style={{ maxHeight: 350 }}>
+              {addToOrderId && (() => {
+                const targetOrder = allOrders.find(o => o.id === addToOrderId);
+                return targetOrder ? (
+                  <>
+                    <View style={[styles.tagihanContainer, { marginBottom: Spacing.two }]}>
+                      <ThemedText type="small" themeColor="textSecondary">Ke order milik:</ThemedText>
+                      <ThemedText type="smallBold" style={{ fontSize: 16, marginTop: 2 }}>
+                        {targetOrder.customerName || 'Tanpa Nama'} ({targetOrder.id})
+                      </ThemedText>
+                      <View style={{ flexDirection: 'row', gap: Spacing.two, marginTop: 4 }}>
+                        <ThemedText type="small" themeColor="textSecondary">Sebelum: {formatRupiah(targetOrder.total)}</ThemedText>
+                        <ThemedText type="small" style={{ color: '#007AFF' }}>+{formatRupiah(getCartTotal())}</ThemedText>
+                      </View>
+                      <ThemedText type="smallBold" style={{ color: '#007AFF', fontSize: 16, marginTop: 2 }}>
+                        Total baru: {formatRupiah(targetOrder.total + getCartTotal())}
+                      </ThemedText>
+                    </View>
+
+                    {/* Payment status for additions */}
+                    <View style={styles.formGroup}>
+                      <ThemedText type="small" style={styles.label}>Status Bayar Tambahan:</ThemedText>
+                      <View style={styles.orderTypeRow}>
+                        <Pressable
+                          style={[
+                            styles.orderTypeBtn,
+                            { backgroundColor: addPaymentStatus === 'unpaid' ? '#FF3B30' : theme.backgroundSelected },
+                          ]}
+                          onPress={() => setAddPaymentStatus('unpaid')}
+                        >
+                          <ThemedText
+                            type="smallBold"
+                            style={{ color: addPaymentStatus === 'unpaid' ? '#ffffff' : theme.text, fontSize: 13 }}
+                          >
+                            ❌ Belum Bayar
+                          </ThemedText>
+                        </Pressable>
+                        <Pressable
+                          style={[
+                            styles.orderTypeBtn,
+                            { backgroundColor: addPaymentStatus === 'paid' ? '#34C759' : theme.backgroundSelected },
+                          ]}
+                          onPress={() => setAddPaymentStatus('paid')}
+                        >
+                          <ThemedText
+                            type="smallBold"
+                            style={{ color: addPaymentStatus === 'paid' ? '#ffffff' : theme.text, fontSize: 13 }}
+                          >
+                            ✅ Sudah Bayar
+                          </ThemedText>
+                        </Pressable>
+                      </View>
+                    </View>
+
+                    {addPaymentStatus === 'paid' && (
+                      <>
+                        {/* Metode Pembayaran */}
+                        <View style={styles.formGroup}>
+                          <ThemedText type="small" style={styles.label}>Metode Pembayaran:</ThemedText>
+                          <ScrollView
+                            horizontal
+                            showsHorizontalScrollIndicator={false}
+                            contentContainerStyle={styles.cashierChipsScroll}
+                          >
+                            {(['Tunai', 'Transfer', 'QRIS Gopay', 'QRIS BPD'] as const).map((method) => {
+                              const isSelected = addPaymentMethod === method;
+                              return (
+                                <Pressable
+                                  key={method}
+                                  style={[
+                                    styles.cashierChip,
+                                    { backgroundColor: isSelected ? '#34C759' : theme.backgroundSelected },
+                                  ]}
+                                  onPress={() => {
+                                    setAddPaymentMethod(method);
+                                    if (method !== 'Tunai') setAddCashPaid(String(getCartTotal()));
+                                    else setAddCashPaid('');
+                                  }}
+                                >
+                                  <ThemedText
+                                    type="smallBold"
+                                    style={{ color: isSelected ? '#ffffff' : theme.text, fontSize: 13 }}
+                                  >
+                                    {method}
+                                  </ThemedText>
+                                </Pressable>
+                              );
+                            })}
+                          </ScrollView>
+                        </View>
+
+                        {/* Input uang tunai */}
+                        {addPaymentMethod === 'Tunai' && (
+                          <View style={styles.formGroup}>
+                            <ThemedText type="small" style={styles.label}>Uang Tunai Bayar (Rp):</ThemedText>
+                            <TextInput
+                              style={[
+                                styles.input,
+                                {
+                                  backgroundColor: theme.background,
+                                  color: theme.text,
+                                  borderColor: theme.backgroundSelected,
+                                },
+                              ]}
+                              value={addCashPaid}
+                              onChangeText={setAddCashPaid}
+                              placeholder={`Min. ${formatRupiah(getCartTotal())}`}
+                              placeholderTextColor={theme.textSecondary}
+                              keyboardType="numeric"
+                            />
+
+                            {(() => {
+                              const paidVal = parseFloat(addCashPaid);
+                              const cartTotal = getCartTotal();
+                              if (!isNaN(paidVal) && paidVal >= cartTotal) {
+                                return (
+                                  <View
+                                    style={{
+                                      flexDirection: 'row',
+                                      justifyContent: 'space-between',
+                                      alignItems: 'center',
+                                      padding: Spacing.two,
+                                      backgroundColor: 'rgba(52, 199, 89, 0.08)',
+                                      borderRadius: Spacing.two,
+                                      marginTop: Spacing.one,
+                                    }}
+                                  >
+                                    <ThemedText type="small" style={{ color: '#34C759' }}>Kembalian:</ThemedText>
+                                    <ThemedText type="smallBold" style={{ color: '#34C759', fontSize: 16 }}>
+                                      {formatRupiah(paidVal - cartTotal)}
+                                    </ThemedText>
+                                  </View>
+                                );
+                              }
+                              return null;
+                            })()}
+                          </View>
+                        )}
+                      </>
+                    )}
+                  </>
+                ) : null;
+              })()}
+
+              <View style={styles.modalActions}>
+                <Pressable
+                  style={[styles.modalBtn, styles.cancelBtn]}
+                  onPress={() => setAddToOrderConfirmVisible(false)}
+                >
+                  <ThemedText style={styles.cancelBtnText}>Batal</ThemedText>
+                </Pressable>
+                <Pressable
+                  style={[styles.modalBtn, styles.saveBtn]}
+                  onPress={handleAddItemsToExistingOrder}
+                >
+                  <ThemedText style={styles.saveBtnText}>Tambahkan</ThemedText>
+                </Pressable>
+              </View>
+            </ThemedView>
+          </View>
+        </Modal>
+
+        {/* Create Order Modal */}
+        <Modal
+          animationType="fade"
+          transparent={true}
+          visible={orderModalVisible}
+          onRequestClose={() => setOrderModalVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <ThemedView type="backgroundElement" style={styles.checkoutModalContent}>
+              <ThemedText type="smallBold" style={styles.modalTitle}>
+                Buat Order
+              </ThemedText>
+
+              <ScrollView style={{ maxHeight: 420 }}>
                 {/* Total tagihan */}
                 <View style={styles.tagihanContainer}>
                   <ThemedText type="small" themeColor="textSecondary">
@@ -663,102 +1133,93 @@ export default function KasirScreen() {
                   </ThemedText>
                 </View>
 
-                {/* Metode Pembayaran */}
+                {/* Takeaway / Dine In */}
                 <View style={styles.formGroup}>
                   <ThemedText type="small" style={styles.label}>
-                    Pilih Metode Pembayaran
+                    Tipe Order
                   </ThemedText>
-                  <ScrollView
-                    horizontal
-                    showsHorizontalScrollIndicator={false}
-                    contentContainerStyle={styles.paymentChipsScroll}
-                  >
-                    {(['Tunai', 'Transfer', 'QRIS Gopay', 'QRIS BPD'] as const).map((method) => {
-                      const isSelected = paymentMethod === method;
-                      return (
-                        <Pressable
-                          key={method}
-                          style={[
-                            styles.paymentChip,
-                            {
-                              backgroundColor: isSelected
-                                ? '#34C759'
-                                : theme.backgroundSelected,
-                            },
-                          ]}
-                          onPress={() => {
-                            setPaymentMethod(method);
-                            if (method !== 'Tunai') {
-                              setCashPaid(String(getCartTotal()));
-                            } else {
-                              setCashPaid('');
-                            }
-                          }}
-                        >
-                          <ThemedText
-                            type="smallBold"
-                            style={{
-                              color: isSelected ? '#ffffff' : theme.text,
-                              fontSize: 13,
-                            }}
-                          >
-                            {method}
-                          </ThemedText>
-                        </Pressable>
-                      );
-                    })}
-                  </ScrollView>
+                  <View style={styles.orderTypeRow}>
+                    <Pressable
+                      style={[
+                        styles.orderTypeBtn,
+                        orderType === 'Dine In' && styles.orderTypeBtnActiveDineIn,
+                        { backgroundColor: orderType === 'Dine In' ? '#007AFF' : theme.backgroundSelected },
+                      ]}
+                      onPress={() => setOrderType('Dine In')}
+                    >
+                      <ThemedText
+                        type="smallBold"
+                        style={{ color: orderType === 'Dine In' ? '#ffffff' : theme.text, fontSize: 14 }}
+                      >
+                        🍽️ Dine In
+                      </ThemedText>
+                    </Pressable>
+                    <Pressable
+                      style={[
+                        styles.orderTypeBtn,
+                        orderType === 'Takeaway' && styles.orderTypeBtnActiveTakeaway,
+                        { backgroundColor: orderType === 'Takeaway' ? '#FF9500' : theme.backgroundSelected },
+                      ]}
+                      onPress={() => setOrderType('Takeaway')}
+                    >
+                      <ThemedText
+                        type="smallBold"
+                        style={{ color: orderType === 'Takeaway' ? '#ffffff' : theme.text, fontSize: 14 }}
+                      >
+                        🥡 Takeaway
+                      </ThemedText>
+                    </Pressable>
+                  </View>
                 </View>
 
-                {/* Form fields */}
-                {paymentMethod === 'Tunai' ? (
-                  <>
-                    <View style={styles.formGroup}>
-                      <ThemedText type="small" style={styles.label}>
-                        Uang Tunai Bayar (Rupiah)
-                      </ThemedText>
-                      <TextInput
-                        style={[
-                          styles.input,
-                          {
-                            backgroundColor: theme.background,
-                            color: theme.text,
-                            borderColor: theme.backgroundSelected,
-                            fontSize: 18,
-                            fontWeight: 'bold',
-                          },
-                        ]}
-                        value={cashPaid}
-                        onChangeText={setCashPaid}
-                        placeholder="Contoh: 50000"
-                        placeholderTextColor={theme.textSecondary}
-                        keyboardType="numeric"
-                        autoFocus
-                      />
-                    </View>
+                {/* Nama Pelanggan (wajib) */}
+                <View style={styles.formGroup}>
+                  <ThemedText type="small" style={styles.label}>
+                    Nama Pelanggan <ThemedText style={{ color: '#FF3B30' }}>*</ThemedText>
+                  </ThemedText>
+                  <TextInput
+                    style={[
+                      styles.input,
+                      {
+                        backgroundColor: theme.background,
+                        color: theme.text,
+                        borderColor: customerName.trim() === '' ? '#FF3B30' : theme.backgroundSelected,
+                      },
+                    ]}
+                    value={customerName}
+                    onChangeText={setCustomerName}
+                    placeholder="Contoh: Pak Budi"
+                    placeholderTextColor={theme.textSecondary}
+                    autoFocus
+                  />
+                  {customerName.trim() === '' && (
+                    <ThemedText type="code" style={{ color: '#FF3B30', fontSize: 11, marginTop: 2 }}>
+                      Nama pelanggan wajib diisi
+                    </ThemedText>
+                  )}
+                </View>
 
-                    {/* Kembalian */}
-                    {parseFloat(cashPaid) >= getCartTotal() && (
-                      <View style={styles.kembalianBox}>
-                        <ThemedText type="small" style={{ color: '#34C759' }}>
-                          Kembalian:
-                        </ThemedText>
-                        <ThemedText type="smallBold" style={styles.kembalianVal}>
-                          {formatRupiah(parseFloat(cashPaid) - getCartTotal())}
-                        </ThemedText>
-                      </View>
-                    )}
-                  </>
-                ) : (
-                  <View style={styles.nonCashTotalBox}>
-                    <ThemedText type="small" themeColor="textSecondary">
-                      Pembayaran Elektronik / Transfer:
-                    </ThemedText>
-                    <ThemedText type="smallBold" style={{ color: '#34C759', fontSize: 16, marginTop: 4 }}>
-                      {formatRupiah(getCartTotal())} (Lunas)
-                    </ThemedText>
-                  </View>
-                )}
+                {/* No. Telepon (opsional) */}
+                <View style={styles.formGroup}>
+                  <ThemedText type="small" style={styles.label}>
+                    No. WhatsApp <ThemedText type="code" style={{ color: theme.textSecondary, fontSize: 11 }}>(opsional)</ThemedText>
+                  </ThemedText>
+                  <TextInput
+                    style={[
+                      styles.input,
+                      {
+                        backgroundColor: theme.background,
+                        color: theme.text,
+                        borderColor: theme.backgroundSelected,
+                      },
+                    ]}
+                    value={customerPhone}
+                    onChangeText={setCustomerPhone}
+                    placeholder="Contoh: 08123456789"
+                    placeholderTextColor={theme.textSecondary}
+                    keyboardType="phone-pad"
+                  />
+                </View>
 
                 {/* Pilih Kasir */}
                 <View style={styles.formGroup}>
@@ -806,50 +1267,10 @@ export default function KasirScreen() {
                   )}
                 </View>
 
+                {/* Catatan */}
                 <View style={styles.formGroup}>
                   <ThemedText type="small" style={styles.label}>
-                    Nama Pelanggan *
-                  </ThemedText>
-                  <TextInput
-                    style={[
-                      styles.input,
-                      {
-                        backgroundColor: theme.background,
-                        color: theme.text,
-                        borderColor: theme.backgroundSelected,
-                      },
-                    ]}
-                    value={customerName}
-                    onChangeText={setCustomerName}
-                    placeholder="Contoh: Pak Budi"
-                    placeholderTextColor={theme.textSecondary}
-                  />
-                </View>
-
-                <View style={styles.formGroup}>
-                  <ThemedText type="small" style={styles.label}>
-                    No. WhatsApp *
-                  </ThemedText>
-                  <TextInput
-                    style={[
-                      styles.input,
-                      {
-                        backgroundColor: theme.background,
-                        color: theme.text,
-                        borderColor: theme.backgroundSelected,
-                      },
-                    ]}
-                    value={customerPhone}
-                    onChangeText={setCustomerPhone}
-                    placeholder="Contoh: 08123456789"
-                    placeholderTextColor={theme.textSecondary}
-                    keyboardType="phone-pad"
-                  />
-                </View>
-
-                <View style={styles.formGroup}>
-                  <ThemedText type="small" style={styles.label}>
-                    Catatan Transaksi (Opsional)
+                    Catatan Pesanan <ThemedText type="code" style={{ color: theme.textSecondary, fontSize: 11 }}>(opsional)</ThemedText>
                   </ThemedText>
                   <TextInput
                     style={[
@@ -871,7 +1292,7 @@ export default function KasirScreen() {
               <View style={styles.modalActions}>
                 <Pressable
                   style={[styles.modalBtn, styles.cancelBtn]}
-                  onPress={() => setCheckoutModalVisible(false)}
+                  onPress={() => setOrderModalVisible(false)}
                 >
                   <ThemedText style={styles.cancelBtnText}>Batal</ThemedText>
                 </Pressable>
@@ -879,114 +1300,84 @@ export default function KasirScreen() {
                   style={[
                     styles.modalBtn,
                     styles.saveBtn,
-                    (!cashPaid || parseFloat(cashPaid) < getCartTotal() || !customerName.trim() || !customerPhone.trim()) && styles.disabledBtn,
+                    !customerName.trim() && styles.disabledBtn,
                   ]}
-                  onPress={handleProcessCheckout}
-                  disabled={!cashPaid || parseFloat(cashPaid) < getCartTotal() || !customerName.trim() || !customerPhone.trim()}
+                  onPress={handleCreateOrder}
+                  disabled={!customerName.trim()}
                 >
-                  <ThemedText style={styles.saveBtnText}>Bayar & Selesai</ThemedText>
+                  <ThemedText style={styles.saveBtnText}>✅ Buat Order</ThemedText>
                 </Pressable>
               </View>
             </ThemedView>
           </View>
         </Modal>
 
-        {/* Post-Transaction Receipt Modal */}
+        {/* Order Created Success Modal */}
         <Modal
           animationType="fade"
           transparent={true}
-          visible={receiptModalVisible}
-          onRequestClose={resetCart}
+          visible={orderDoneModalVisible}
+          onRequestClose={resetAfterOrder}
         >
           <View style={styles.modalOverlay}>
-            <ThemedView type="backgroundElement" style={styles.receiptModalContent}>
-              <Pressable
-                style={styles.absoluteCloseBtn}
-                onPress={resetCart}
-              >
-                <ThemedText style={{ fontSize: 24, fontWeight: 'bold', lineHeight: 26 }}>×</ThemedText>
+            <ThemedView type="backgroundElement" style={[styles.receiptModalContent, { position: 'relative' }]}>
+              {/* X close button */}
+              <Pressable style={styles.absoluteCloseBtn} onPress={resetAfterOrder}>
+                <ThemedText style={{ fontSize: 20, fontWeight: 'bold', lineHeight: 22 }}>×</ThemedText>
               </Pressable>
 
-              <ThemedText type="smallBold" style={styles.modalTitle}>
-                Transaksi Berhasil
-              </ThemedText>
-
-              {completedTransaction && (
-                <ScrollView style={styles.receiptSummary}>
-                  <ThemedText type="code" style={{ textAlign: 'center', marginBottom: Spacing.two }}>
-                    No. Struk: {completedTransaction.id}
-                  </ThemedText>
-                  {completedTransaction.cashierName && (
-                    <ThemedText type="code" style={{ textAlign: 'center', marginBottom: Spacing.two }}>
-                      Kasir: {completedTransaction.cashierName}
-                    </ThemedText>
-                  )}
-                  <View style={styles.divider} />
-                  
-                  {completedTransaction.items.map((item) => (
-                    <View key={item.id} style={styles.receiptItem}>
-                      <ThemedText type="small" style={{ flex: 1 }}>{item.name}</ThemedText>
-                      <ThemedText type="small">
-                        {item.quantity}x {formatRupiah(item.price)}
-                      </ThemedText>
-                    </View>
-                  ))}
-
-                  <View style={{ borderTopWidth: 1, borderStyle: 'dashed', borderColor: theme.textSecondary, marginVertical: 8 }} />
-                  
-                  <View style={styles.receiptRow}>
-                    <ThemedText type="smallBold">Total</ThemedText>
-                    <ThemedText type="smallBold">{formatRupiah(completedTransaction.total)}</ThemedText>
-                  </View>
-                  <View style={styles.receiptRow}>
-                    <ThemedText type="small">Bayar</ThemedText>
-                    <ThemedText type="small">{formatRupiah(completedTransaction.cashPaid)}</ThemedText>
-                  </View>
-                  <View style={styles.receiptRow}>
-                    <ThemedText type="smallBold" style={{ color: '#34C759' }}>Kembalian</ThemedText>
-                    <ThemedText type="smallBold" style={{ color: '#34C759' }}>{formatRupiah(completedTransaction.change)}</ThemedText>
-                  </View>
-                  <View style={{ borderTopWidth: 1, borderStyle: 'dashed', borderColor: theme.textSecondary, marginVertical: 8 }} />
-                  <View style={styles.receiptRow}>
-                    <ThemedText type="small">Metode Bayar</ThemedText>
-                    <ThemedText type="smallBold">{completedTransaction.paymentMethod || 'Tunai'}</ThemedText>
-                  </View>
-                  {completedTransaction.notes && (
-                    <View style={styles.receiptRow}>
-                      <ThemedText type="small">Catatan</ThemedText>
-                      <ThemedText type="small" style={{ fontStyle: 'italic' }}>{completedTransaction.notes}</ThemedText>
-                    </View>
-                  )}
-                </ScrollView>
-              )}
-
-              {/* Action Buttons */}
-              <View style={styles.receiptActions}>
-                <Pressable style={[styles.receiptBtn, styles.printBtn]} onPress={handlePrint}>
-                  <ThemedText style={styles.receiptBtnText}>🖨️ Cetak Struk</ThemedText>
-                </Pressable>
-                
-                <Pressable
-                  style={[
-                    styles.receiptBtn,
-                    styles.waBtn,
-                    (!completedTransaction?.customerPhone) && styles.disabledReceiptBtn,
-                  ]}
-                  onPress={handleWhatsApp}
-                  disabled={!completedTransaction?.customerPhone}
-                >
-                  <ThemedText style={styles.receiptBtnText}>💬 Kirim ke WA</ThemedText>
-                </Pressable>
+              <View style={{
+                width: 72,
+                height: 72,
+                borderRadius: 36,
+                backgroundColor: 'rgba(52, 199, 89, 0.15)',
+                alignItems: 'center',
+                justifyContent: 'center',
+                marginBottom: Spacing.two
+              }}>
+                <View style={{
+                  width: 48,
+                  height: 48,
+                  borderRadius: 24,
+                  backgroundColor: '#34C759',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}>
+                  <ThemedText style={{ color: '#fff', fontSize: 28, fontWeight: 'bold', marginTop: -2 }}>✓</ThemedText>
+                </View>
               </View>
 
-              {!completedTransaction?.customerPhone && (
-                <ThemedText type="code" style={styles.hintText} themeColor="textSecondary">
-                  *Masukkan nomor WA pelanggan saat checkout untuk mengaktifkan opsi kirim WhatsApp.
-                </ThemedText>
+              <ThemedText type="smallBold" style={[styles.modalTitle, { textAlign: 'center' }]}>
+                {isAddToExisting ? 'Pesanan Ditambahkan!' : 'Order Dibuat!'}
+              </ThemedText>
+
+              {createdOrderId && (
+                <View style={[styles.tagihanContainer, { marginTop: Spacing.two, width: '100%' }]}>
+                  <ThemedText type="code" themeColor="textSecondary">No. Order:</ThemedText>
+                  <ThemedText type="smallBold" style={{ fontSize: 20, color: '#007AFF', marginTop: 2 }}>
+                    {createdOrderId}
+                  </ThemedText>
+                </View>
               )}
 
-              <Pressable style={styles.doneBtn} onPress={resetCart}>
-                <ThemedText style={styles.doneBtnText}>Transaksi Baru</ThemedText>
+              <ThemedText
+                type="small"
+                themeColor="textSecondary"
+                style={{ textAlign: 'center', marginTop: Spacing.two, marginBottom: Spacing.three, lineHeight: 20 }}
+              >
+                {isAddToExisting
+                  ? 'Item berhasil ditambahkan ke order yang dipilih.'
+                  : 'Order masuk ke antrian. Pembayaran dapat dilakukan nanti di tab Pesanan.'}
+              </ThemedText>
+
+              <Pressable
+                style={styles.doneBtn}
+                onPress={() => {
+                  setIsAddToExisting(false);
+                  resetAfterOrder();
+                }}
+              >
+                <ThemedText style={styles.doneBtnText}>Selesai</ThemedText>
               </Pressable>
             </ThemedView>
           </View>
@@ -1194,8 +1585,20 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#34C759',
   },
+  addToOrderBtn: {
+    backgroundColor: '#FF9500',
+    height: 44,
+    borderRadius: Spacing.two,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  addToOrderBtnText: {
+    color: '#ffffff',
+    fontWeight: 'bold',
+    fontSize: 14,
+  },
   checkoutBtn: {
-    backgroundColor: '#34C759',
+    backgroundColor: '#007AFF',
     height: 48,
     borderRadius: Spacing.two,
     alignItems: 'center',
@@ -1303,9 +1706,9 @@ const styles = StyleSheet.create({
   },
   tagihanContainer: {
     alignItems: 'center',
-    paddingVertical: Spacing.two,
-    backgroundColor: 'rgba(0, 122, 255, 0.05)',
-    borderRadius: Spacing.two,
+    paddingVertical: Spacing.three,
+    backgroundColor: 'rgba(0, 122, 255, 0.08)',
+    borderRadius: Spacing.three,
     marginBottom: Spacing.two,
   },
   tagihanTotal: {
@@ -1313,6 +1716,31 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#007AFF',
     marginTop: Spacing.half,
+  },
+  orderTypeRow: {
+    flexDirection: 'row',
+    gap: Spacing.two,
+  },
+  orderTypeBtn: {
+    flex: 1,
+    height: 48,
+    borderRadius: Spacing.two,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  orderTypeBtnActiveDineIn: {
+    shadowColor: '#007AFF',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  orderTypeBtnActiveTakeaway: {
+    shadowColor: '#FF9500',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 3,
   },
   formGroup: {
     gap: Spacing.one,
@@ -1327,19 +1755,6 @@ const styles = StyleSheet.create({
     borderRadius: Spacing.two,
     paddingHorizontal: Spacing.three,
     fontSize: 15,
-  },
-  kembalianBox: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: Spacing.two,
-    backgroundColor: 'rgba(52, 199, 89, 0.08)',
-    borderRadius: Spacing.two,
-    marginBottom: Spacing.two,
-  },
-  kembalianVal: {
-    fontSize: 18,
-    color: '#34C759',
   },
   modalActions: {
     flexDirection: 'row',
@@ -1377,10 +1792,71 @@ const styles = StyleSheet.create({
   receiptModalContent: {
     width: '100%',
     maxWidth: 360,
-    borderRadius: Spacing.four,
-    padding: Spacing.four,
+    borderRadius: 28,
+    padding: Spacing.four + 8,
     alignItems: 'center',
-    elevation: 5,
+    elevation: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 12 },
+    shadowOpacity: 0.15,
+    shadowRadius: 24,
+  },
+  doneBtn: {
+    width: '100%',
+    height: 54,
+    backgroundColor: '#007AFF',
+    borderRadius: Spacing.three,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: Spacing.three,
+    shadowColor: '#007AFF',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  doneBtnText: {
+    color: '#ffffff',
+    fontWeight: '800',
+    fontSize: 16,
+  },
+  cashierChipsScroll: {
+    paddingVertical: Spacing.one,
+    gap: Spacing.two,
+  },
+  cashierChip: {
+    paddingHorizontal: Spacing.three,
+    paddingVertical: Spacing.two,
+    borderRadius: Spacing.three,
+    marginRight: Spacing.one,
+  },
+  orderSelectItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: Spacing.two,
+    paddingHorizontal: Spacing.two,
+    borderWidth: 1,
+    borderRadius: Spacing.two,
+  },
+  closeIconBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(142, 142, 147, 0.15)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  miniTabContainer: {
+    flexDirection: 'row',
+    borderRadius: Spacing.two,
+    padding: 4,
+    marginBottom: Spacing.two,
+  },
+  miniTab: {
+    flex: 1,
+    paddingVertical: Spacing.one + 2,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   absoluteCloseBtn: {
     position: 'absolute',
@@ -1393,104 +1869,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 10,
-  },
-  receiptSummary: {
-    width: '100%',
-    maxHeight: 250,
-    marginTop: Spacing.two,
-    padding: Spacing.two,
-    backgroundColor: 'rgba(0,0,0,0.02)',
-    borderRadius: Spacing.two,
-  },
-  divider: {
-    height: 1,
-    borderStyle: 'dashed',
-    borderWidth: 0.5,
-    borderColor: '#8E8E93',
-    marginVertical: Spacing.two,
-  },
-  receiptItem: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: Spacing.one,
-  },
-  receiptRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginVertical: 2,
-  },
-  receiptActions: {
-    flexDirection: 'row',
-    gap: Spacing.two,
-    width: '100%',
-    marginTop: Spacing.three,
-  },
-  receiptBtn: {
-    flex: 1,
-    height: 44,
-    borderRadius: Spacing.two,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  printBtn: {
-    backgroundColor: '#8E8E93',
-  },
-  waBtn: {
-    backgroundColor: '#34C759',
-  },
-  disabledReceiptBtn: {
-    backgroundColor: '#AEAEB2',
-    opacity: 0.5,
-  },
-  receiptBtnText: {
-    color: '#ffffff',
-    fontWeight: 'bold',
-    fontSize: 13,
-  },
-  hintText: {
-    fontSize: 10.5,
-    textAlign: 'center',
-    marginTop: Spacing.two,
-  },
-  doneBtn: {
-    width: '100%',
-    height: 48,
-    backgroundColor: '#007AFF',
-    borderRadius: Spacing.two,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: Spacing.three,
-  },
-  doneBtnText: {
-    color: '#ffffff',
-    fontWeight: 'bold',
-    fontSize: 15,
-  },
-  cashierChipsScroll: {
-    paddingVertical: Spacing.one,
-    gap: Spacing.two,
-  },
-  cashierChip: {
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
-    borderRadius: Spacing.three,
-    marginRight: Spacing.one,
-  },
-  paymentChipsScroll: {
-    paddingVertical: Spacing.one,
-    gap: Spacing.two,
-  },
-  paymentChip: {
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
-    borderRadius: Spacing.three,
-    marginRight: Spacing.one,
-  },
-  nonCashTotalBox: {
-    padding: Spacing.two,
-    backgroundColor: 'rgba(52, 199, 89, 0.08)',
-    borderRadius: Spacing.two,
-    marginBottom: Spacing.two,
   },
   cardCartControls: {
     flexDirection: 'row',

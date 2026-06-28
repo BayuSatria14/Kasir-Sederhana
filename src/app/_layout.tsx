@@ -98,12 +98,6 @@ export default function TabLayout() {
             ),
           }}
         />
-        <Tabs.Screen
-          name="explore"
-          options={{
-            href: null, // Sembunyikan halaman explore bawaan template
-          }}
-        />
       </Tabs>
     </ThemeProvider>
   );

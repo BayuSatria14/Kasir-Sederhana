@@ -53,6 +53,7 @@ export default function HistoryScreen() {
         .select(`
           *,
           transaction_items (
+            id,
             product_id,
             name,
             quantity,
@@ -74,15 +75,18 @@ export default function HistoryScreen() {
           customerName: tx.customer_name || undefined,
           customerPhone: tx.customer_phone || undefined,
           cashierName: tx.cashier_name || undefined,
-          paymentMethod: tx.payment_method || undefined,
+          paymentMethod: tx.payment_method || 'Tunai',
           notes: tx.notes || undefined,
           status: tx.status || undefined,
+          orderType: tx.order_type || 'Dine In',
+          paymentStatus: tx.payment_status || 'paid',
           items: (tx.transaction_items || []).map((item: any) => ({
             id: item.product_id,
             name: item.name,
             price: Number(item.price),
             quantity: item.quantity,
             completed: item.completed,
+            dbId: item.id,
           })),
         }));
         setHistory(mappedHistory);
@@ -836,7 +840,7 @@ export default function HistoryScreen() {
 
                   {/* Items List */}
                   {selectedTx.items.map((item) => (
-                    <View key={item.id} style={styles.itemRow}>
+                    <View key={item.dbId || item.id} style={styles.itemRow}>
                       <View style={{ flex: 1 }}>
                         <ThemedText type="smallBold">
                           {item.name}

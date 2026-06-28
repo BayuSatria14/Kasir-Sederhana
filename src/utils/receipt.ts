@@ -4,6 +4,9 @@ export interface CartItem {
   price: number;
   quantity: number;
   completed?: boolean;
+  dbId?: string;
+  paymentStatus?: 'paid' | 'unpaid';
+  note?: string;
 }
 
 export interface Transaction {
@@ -19,6 +22,8 @@ export interface Transaction {
   paymentMethod: 'Tunai' | 'Transfer' | 'QRIS Gopay' | 'QRIS BPD';
   notes?: string;
   status?: 'pending' | 'completed';
+  orderType?: 'Takeaway' | 'Dine In';
+  paymentStatus?: 'paid' | 'unpaid';
 }
 
 /**
@@ -115,6 +120,9 @@ export function formatWhatsAppReceipt(transaction: Transaction, shopName: string
   text += `No. Struk: _${transaction.id}_\n`;
   text += `Tanggal: ${formatDateTime(transaction.date)}\n`;
 
+  if (transaction.orderType) {
+    text += `Tipe Order: *${transaction.orderType}*\n`;
+  }
   if (transaction.customerName) {
     text += `Pelanggan: *${transaction.customerName}*\n`;
   }
@@ -220,6 +228,7 @@ export function generateHTMLReceipt(transaction: Transaction, shopName: string =
         <div style="font-size: 13px; margin-bottom: 4px;">
           <div>No. Struk: ${transaction.id}</div>
           <div>Tanggal: ${formatDateTime(transaction.date)}</div>
+          ${transaction.orderType ? `<div>Tipe Order: ${transaction.orderType}</div>` : ''}
           ${transaction.customerName ? `<div>Pelanggan: ${transaction.customerName}</div>` : ''}
           ${transaction.cashierName ? `<div>Kasir: ${transaction.cashierName}</div>` : ''}
           <div>Metode Bayar: ${transaction.paymentMethod || 'Tunai'}</div>
