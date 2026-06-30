@@ -20,6 +20,7 @@ export interface Transaction {
   customerPhone?: string;
   cashierName?: string;
   paymentMethod: 'Tunai' | 'Transfer' | 'QRIS Gopay' | 'QRIS BPD';
+  paymentRef?: string;
   notes?: string;
   status?: 'pending' | 'completed';
   orderType?: 'Takeaway' | 'Dine In';

@@ -13,8 +13,6 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from 'expo-router';
 import * as Print from 'expo-print';
-import * as FileSystem from 'expo-file-system/legacy';
-import * as Sharing from 'expo-sharing';
 import { supabase } from '@/utils/supabase';
 
 import { ThemedText } from '@/components/themed-text';
@@ -51,7 +49,7 @@ export default function HistoryScreen() {
       const { data, error } = await supabase
         .from('transactions')
         .select(`
-          *,
+          id, date, total, cash_paid, change, customer_name, customer_phone, cashier_name, payment_method, notes, status, order_type, payment_status,
           transaction_items (
             id,
             product_id,
@@ -76,6 +74,7 @@ export default function HistoryScreen() {
           customerPhone: tx.customer_phone || undefined,
           cashierName: tx.cashier_name || undefined,
           paymentMethod: tx.payment_method || 'Tunai',
+          paymentRef: tx.payment_ref || undefined,
           notes: tx.notes || undefined,
           status: tx.status || undefined,
           orderType: tx.order_type || 'Dine In',
@@ -134,144 +133,6 @@ export default function HistoryScreen() {
       supabase.removeChannel(channel);
     };
   }, []);
-
-  const handleExportExcel = async () => {
-    try {
-      const filteredHistory = getFilteredTransactions();
-      if (filteredHistory.length === 0) {
-        Alert.alert('Ekspor Gagal', 'Tidak ada data transaksi untuk diekspor.');
-        return;
-      }
-
-      // 1. Prepare CSV Header (use semi-colon separator for easier Excel opening in Indonesian locale)
-      const headers = [
-        'No. Struk',
-        'Tanggal',
-        'Waktu',
-        'Kasir',
-        'Pelanggan',
-        'No. WhatsApp',
-        'Metode Pembayaran',
-        'Catatan',
-        'Nama Menu',
-        'Jumlah (Qty)',
-        'Harga Satuan',
-        'Subtotal',
-        'Total Belanja',
-        'Uang Bayar',
-        'Uang Kembali'
-      ];
-      
-      let csvContent = headers.join(';') + '\n';
-
-      // 2. Populate rows
-      filteredHistory.forEach((tx) => {
-        const dateTimeStr = formatDateTime(tx.date);
-        const [dateVal, timeVal] = dateTimeStr.split(' ');
-
-        const cleanNotes = tx.notes ? tx.notes.replace(/[\n\r;]/g, ' ') : '';
-        const cleanCustomerName = tx.customerName ? tx.customerName.replace(/[\n\r;]/g, ' ') : '';
-        const cleanCashierName = tx.cashierName ? tx.cashierName.replace(/[\n\r;]/g, ' ') : '';
-
-        // If there are no items (should not happen, but safeguard)
-        if (tx.items.length === 0) {
-          const row = [
-            tx.id,
-            dateVal,
-            timeVal,
-            `"${cleanCashierName}"`,
-            `"${cleanCustomerName}"`,
-            `"${tx.customerPhone || ''}"`,
-            `"${tx.paymentMethod}"`,
-            `"${cleanNotes}"`,
-            '', // Product Name
-            '', // Qty
-            '', // Unit Price
-            '', // Subtotal
-            tx.total,
-            tx.cashPaid,
-            tx.change
-          ];
-          csvContent += row.join(';') + '\n';
-        } else {
-          // Add a row for each item in the transaction
-          tx.items.forEach((item) => {
-            const subtotal = item.price * item.quantity;
-            const cleanProductName = item.name.replace(/[\n\r;]/g, ' ');
-            const row = [
-              tx.id,
-              dateVal,
-              timeVal,
-              `"${cleanCashierName}"`,
-              `"${cleanCustomerName}"`,
-              `"${tx.customerPhone || ''}"`,
-              `"${tx.paymentMethod}"`,
-              `"${cleanNotes}"`,
-              `"${cleanProductName}"`,
-              item.quantity,
-              item.price,
-              subtotal,
-              tx.total,
-              tx.cashPaid,
-              tx.change
-            ];
-            csvContent += row.join(';') + '\n';
-          });
-        }
-      });
-      // Calculate total transactions and revenue for summary rows at the bottom
-      const totalTransactions = filteredHistory.length;
-      const totalRevenue = filteredHistory.reduce((sum, tx) => sum + tx.total, 0);
-
-      // Add an empty row for spacing
-      csvContent += ';\n';
-
-      // Add Total Transactions row
-      const totalTxRow = [
-        'TOTAL TRANSAKSI',
-        '', '', '', '', '', '', '', '', '', '',
-        totalTransactions,
-        '', '', ''
-      ];
-      csvContent += totalTxRow.join(';') + '\n';
-
-      // Add Total Revenue row
-      const totalRevRow = [
-        'TOTAL PEMASUKAN',
-        '', '', '', '', '', '', '', '', '', '',
-        totalRevenue,
-        '', '', ''
-      ];
-      csvContent += totalRevRow.join(';') + '\n';
-
-      // 3. Save file locally
-      const activeFilterLabel = getActiveDateLabel().replace(/[\/ ]/g, '_');
-      const filename = `Laporan_Kasir_${activeFilterLabel}.csv`;
-      const fileUri = `${FileSystem.documentDirectory}${filename}`;
-
-      // Write file as UTF-8 with BOM (Byte Order Mark) so Excel displays Indonesian letters/symbols correctly
-      const bom = '\ufeff'; 
-      await FileSystem.writeAsStringAsync(fileUri, bom + csvContent, {
-        encoding: FileSystem.EncodingType.UTF8,
-      });
-
-      // 4. Share the file
-      const isSharingAvailable = await Sharing.isAvailableAsync();
-      if (isSharingAvailable) {
-        await Sharing.shareAsync(fileUri, {
-          mimeType: 'text/csv',
-          dialogTitle: 'Bagikan Laporan Penjualan Excel',
-          UTI: 'public.comma-separated-values-text'
-        });
-      } else {
-        Alert.alert('Fitur Sharing Tidak Tersedia', `File disimpan di: ${fileUri}`);
-      }
-
-    } catch (error) {
-      console.error('Failed to export Excel:', error);
-      Alert.alert('Gagal Ekspor', 'Terjadi kesalahan saat menyusun laporan Excel.');
-    }
-  };
 
   const handleClearHistory = () => {
     const performClear = async () => {
@@ -615,9 +476,6 @@ export default function HistoryScreen() {
         
         {history.length > 0 && (
           <View style={styles.actionHeaderRow}>
-            <Pressable style={styles.exportBtn} onPress={handleExportExcel}>
-              <ThemedText style={styles.exportBtnText}>📊 Ekspor Excel</ThemedText>
-            </Pressable>
             <Pressable style={styles.clearBtn} onPress={handleClearHistory}>
               <ThemedText style={styles.clearBtnText}>Hapus Semua</ThemedText>
             </Pressable>

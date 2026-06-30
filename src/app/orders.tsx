@@ -8,11 +8,13 @@ import {
   Platform,
   Modal,
   TextInput,
+  Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, router } from 'expo-router';
 import { supabase } from '@/utils/supabase';
 import * as Print from 'expo-print';
+import * as ImagePicker from 'expo-image-picker';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -46,6 +48,7 @@ export default function OrdersScreen() {
   const [payingTx, setPayingTx] = useState<Transaction | null>(null);
   const [paymentMethod, setPaymentMethod] = useState<'Tunai' | 'Transfer' | 'QRIS Gopay' | 'QRIS BPD'>('Tunai');
   const [cashPaid, setCashPaid] = useState('');
+  const [paymentRefs, setPaymentRefs] = useState<string[]>([]);
 
   // Receipt modal (after payment done)
   const [receiptModalVisible, setReceiptModalVisible] = useState(false);
@@ -56,7 +59,7 @@ export default function OrdersScreen() {
       const { data, error } = await supabase
         .from('transactions')
         .select(`
-          *,
+          id, date, total, cash_paid, change, customer_name, customer_phone, cashier_name, payment_method, notes, status, order_type, payment_status,
           transaction_items (
             id,
             product_id,
@@ -82,6 +85,7 @@ export default function OrdersScreen() {
           customerPhone: tx.customer_phone || undefined,
           cashierName: tx.cashier_name || undefined,
           paymentMethod: tx.payment_method || 'Tunai',
+          paymentRef: tx.payment_ref || undefined,
           notes: tx.notes || undefined,
           status: tx.status || undefined,
           orderType: tx.order_type || 'Dine In',
@@ -165,7 +169,8 @@ export default function OrdersScreen() {
           : item
       );
       const allCompleted = updatedItems.every(item => item.completed);
-      const nextStatus: 'completed' | 'pending' = allCompleted ? 'completed' : 'pending';
+      const isPaid = (txObj.paymentStatus || 'paid') === 'paid';
+      const nextStatus: 'completed' | 'pending' = (allCompleted && isPaid) ? 'completed' : 'pending';
 
       const { error: txError } = await supabase
         .from('transactions')
@@ -303,7 +308,29 @@ export default function OrdersScreen() {
     setPayingTx(tx);
     setPaymentMethod('Tunai');
     setCashPaid('');
+    setPaymentRefs([]);
     setPayModalVisible(true);
+  };
+
+  const handlePickImage = async () => {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: false,
+        allowsMultipleSelection: true,
+        quality: 0.5,
+        base64: true,
+      });
+
+      if (!result.canceled) {
+        const newImages = result.assets
+          .filter(a => a.base64)
+          .map(a => `data:image/jpeg;base64,${a.base64}`);
+        setPaymentRefs(prev => [...prev, ...newImages]);
+      }
+    } catch (e) {
+      Alert.alert('Gagal', 'Terjadi kesalahan saat memilih gambar.');
+    }
   };
 
   // Process payment for an existing unpaid order
@@ -321,6 +348,9 @@ export default function OrdersScreen() {
     const newCashPaid = payingTx.cashPaid + paid;
     const newChange = payingTx.change + change;
 
+    const allCompleted = payingTx.items.every(item => item.completed);
+    const nextStatus = allCompleted ? 'completed' : payingTx.status;
+
     try {
       const { error } = await supabase
         .from('transactions')
@@ -329,6 +359,8 @@ export default function OrdersScreen() {
           change: newChange,
           payment_method: paymentMethod,
           payment_status: 'paid',
+          payment_ref: paymentRefs.length > 0 ? JSON.stringify(paymentRefs) : null,
+          status: nextStatus,
         })
         .eq('id', payingTx.id);
 
@@ -345,7 +377,9 @@ export default function OrdersScreen() {
         cashPaid: newCashPaid,
         change: newChange,
         paymentMethod,
+        paymentRef: paymentRefs.length > 0 ? JSON.stringify(paymentRefs) : undefined,
         paymentStatus: 'paid',
+        status: nextStatus,
       };
 
       setPaidTransaction(paidTx);
@@ -658,7 +692,11 @@ export default function OrdersScreen() {
     const unpaidAmount = payingTx.items.filter(i => i.paymentStatus === 'unpaid').reduce((sum, item) => sum + item.price * item.quantity, 0);
     const paid = parseFloat(cashPaid);
     const change = !isNaN(paid) && paid >= unpaidAmount ? paid - unpaidAmount : 0;
-    const canPay = paymentMethod !== 'Tunai' || (!isNaN(paid) && paid >= unpaidAmount);
+    
+    // QRIS requires image proof (paymentRefs must not be empty)
+    const canPay = paymentMethod === 'Tunai'
+      ? (!isNaN(paid) && paid >= unpaidAmount)
+      : (paymentRefs.length > 0);
 
     return (
       <Modal
@@ -765,13 +803,57 @@ export default function OrdersScreen() {
                 )}
               </View>
             ) : (
-              <View style={styles.nonCashBox}>
+              <View style={[styles.nonCashBox, { padding: Spacing.three }]}>
                 <ThemedText type="small" themeColor="textSecondary">
                   Pembayaran {paymentMethod}:
                 </ThemedText>
                 <ThemedText type="smallBold" style={{ color: '#34C759', fontSize: 16, marginTop: 4 }}>
                   {formatRupiah(unpaidAmount)} (Lunas)
                 </ThemedText>
+                
+                {/* Wajib Upload Bukti QRIS */}
+                <View style={{ marginTop: Spacing.three }}>
+                  <ThemedText type="small" style={[styles.label, { marginBottom: 8 }]}>
+                    Bukti {paymentMethod} (Wajib)
+                  </ThemedText>
+                  
+                  {paymentRefs.length > 0 && (
+                    <ScrollView horizontal pagingEnabled showsHorizontalScrollIndicator={false} style={{ width: '100%', borderRadius: 8, marginBottom: 8 }}>
+                      {paymentRefs.map((uri, idx) => (
+                        <View key={idx} style={{ position: 'relative', width: 280, marginRight: 8 }}>
+                          <Image 
+                            source={{ uri }} 
+                            style={{ width: '100%', height: 160, borderRadius: 8, backgroundColor: 'rgba(128,128,128,0.2)' }} 
+                            resizeMode="cover" 
+                          />
+                          <Pressable 
+                            style={{ position: 'absolute', top: 8, right: 8, backgroundColor: 'rgba(0,0,0,0.6)', padding: 6, borderRadius: 12 }}
+                            onPress={() => setPaymentRefs(prev => prev.filter((_, i) => i !== idx))}
+                          >
+                            <ThemedText style={{ color: '#fff', fontSize: 12, fontWeight: 'bold' }}>Hapus</ThemedText>
+                          </Pressable>
+                        </View>
+                      ))}
+                    </ScrollView>
+                  )}
+                  
+                  <Pressable
+                    style={{
+                      borderWidth: 1,
+                      borderColor: '#007AFF',
+                      borderStyle: 'dashed',
+                      borderRadius: 8,
+                      height: paymentRefs.length > 0 ? 60 : 120,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      backgroundColor: 'rgba(0,122,255,0.05)'
+                    }}
+                    onPress={handlePickImage}
+                  >
+                    {!paymentRefs.length && <ThemedText style={{ fontSize: 24, marginBottom: 8 }}>🖼️</ThemedText>}
+                    <ThemedText type="smallBold" style={{ color: '#007AFF' }}>{paymentRefs.length > 0 ? '+ Tambah Bukti Lain' : '+ Upload dari Galeri'}</ThemedText>
+                  </Pressable>
+                </View>
               </View>
             )}
 

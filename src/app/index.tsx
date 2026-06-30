@@ -10,10 +10,12 @@ import {
   View,
   useWindowDimensions,
   Linking,
+  Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from 'expo-router';
 import * as Print from 'expo-print';
+import * as ImagePicker from 'expo-image-picker';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -83,6 +85,7 @@ export default function KasirScreen() {
   const [addPaymentStatus, setAddPaymentStatus] = useState<'paid' | 'unpaid'>('unpaid');
   const [addPaymentMethod, setAddPaymentMethod] = useState<'Tunai' | 'Transfer' | 'QRIS Gopay' | 'QRIS BPD'>('Tunai');
   const [addCashPaid, setAddCashPaid] = useState('');
+  const [addPaymentRefs, setAddPaymentRefs] = useState<string[]>([]);
 
   // Post-order modal
   const [orderDoneModalVisible, setOrderDoneModalVisible] = useState(false);
@@ -152,7 +155,7 @@ export default function KasirScreen() {
     try {
       const { data, error } = await supabase
         .from('transactions')
-        .select(`*, transaction_items (id, product_id, name, quantity, price, completed, payment_status)`)
+        .select(`id, date, total, cash_paid, change, customer_name, customer_phone, cashier_name, payment_method, notes, status, order_type, payment_status, transaction_items (id, product_id, name, quantity, price, completed, payment_status)`)
         .order('date', { ascending: false });
 
       if (error) throw error;
@@ -306,9 +309,32 @@ export default function KasirScreen() {
   const handleSelectExistingOrder = (orderId: string) => {
     setAddToOrderId(orderId);
     setAddPaymentStatus('unpaid');
+    setAddPaymentRefs([]);
     setSelectOrderModalVisible(false);
     setAddToOrderConfirmVisible(true);
   };
+
+  const handlePickAddImage = async () => {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: false,
+        allowsMultipleSelection: true,
+        quality: 0.5,
+        base64: true,
+      });
+
+      if (!result.canceled) {
+        const newImages = result.assets
+          .filter(a => a.base64)
+          .map(a => `data:image/jpeg;base64,${a.base64}`);
+        setAddPaymentRefs(prev => [...prev, ...newImages]);
+      }
+    } catch (e) {
+      Alert.alert('Gagal', 'Terjadi kesalahan saat memilih gambar.');
+    }
+  };
+
 
   // Add cart items to an existing order
   const handleAddItemsToExistingOrder = async () => {
@@ -330,6 +356,10 @@ export default function KasirScreen() {
         paidForAddition = cashInput;
         changeForAddition = cashInput - addedTotal;
       } else {
+        if (addPaymentRefs.length === 0) {
+          Alert.alert('Gagal', 'Bukti pembayaran wajib diupload.');
+          return;
+        }
         paidForAddition = addedTotal;
         changeForAddition = 0;
       }
@@ -378,6 +408,24 @@ export default function KasirScreen() {
 
       if (addPaymentStatus === 'paid') {
         updateData.payment_method = addPaymentMethod;
+        if (addPaymentMethod !== 'Tunai' && addPaymentRefs.length > 0) {
+          let finalPaymentRefs = [...addPaymentRefs];
+          try {
+            const { data: existingTx } = await supabase.from('transactions').select('payment_ref').eq('id', addToOrderId).single();
+            if (existingTx && existingTx.payment_ref) {
+              try {
+                const parsed = JSON.parse(existingTx.payment_ref);
+                if (Array.isArray(parsed)) finalPaymentRefs = [...parsed, ...addPaymentRefs];
+                else finalPaymentRefs = [existingTx.payment_ref, ...addPaymentRefs];
+              } catch {
+                finalPaymentRefs = [existingTx.payment_ref, ...addPaymentRefs];
+              }
+            }
+          } catch (e) {
+            console.warn('Failed to fetch existing payment_ref', e);
+          }
+          updateData.payment_ref = JSON.stringify(finalPaymentRefs);
+        }
       }
 
       const { error: txError } = await supabase
@@ -1083,6 +1131,48 @@ export default function KasirScreen() {
                               }
                               return null;
                             })()}
+                          </View>
+                        )}
+                        
+                        {/* Upload bukti if not tunai */}
+                        {addPaymentMethod !== 'Tunai' && (
+                          <View style={[styles.formGroup, { marginTop: Spacing.two }]}>
+                            <ThemedText type="small" style={styles.label}>Bukti Pembayaran (Wajib):</ThemedText>
+                            {addPaymentRefs.length > 0 && (
+                              <ScrollView horizontal pagingEnabled showsHorizontalScrollIndicator={false} style={{ width: '100%', borderRadius: 8, marginBottom: 8 }}>
+                                {addPaymentRefs.map((uri, idx) => (
+                                  <View key={idx} style={{ position: 'relative', width: 280, marginRight: 8 }}>
+                                    <Image 
+                                      source={{ uri }} 
+                                      style={{ width: '100%', height: 160, borderRadius: 8, backgroundColor: 'rgba(128,128,128,0.2)' }} 
+                                      resizeMode="cover" 
+                                    />
+                                    <Pressable 
+                                      style={{ position: 'absolute', top: 8, right: 8, backgroundColor: 'rgba(0,0,0,0.6)', padding: 6, borderRadius: 12 }}
+                                      onPress={() => setAddPaymentRefs(prev => prev.filter((_, i) => i !== idx))}
+                                    >
+                                      <ThemedText style={{ color: '#fff', fontSize: 12, fontWeight: 'bold' }}>Hapus</ThemedText>
+                                    </Pressable>
+                                  </View>
+                                ))}
+                              </ScrollView>
+                            )}
+                            <Pressable
+                              style={{
+                                borderWidth: 1,
+                                borderColor: '#007AFF',
+                                borderStyle: 'dashed',
+                                borderRadius: 8,
+                                height: addPaymentRefs.length > 0 ? 60 : 120,
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                backgroundColor: 'rgba(0,122,255,0.05)'
+                              }}
+                              onPress={handlePickAddImage}
+                            >
+                              {!addPaymentRefs.length && <ThemedText style={{ fontSize: 24, marginBottom: 8 }}>🖼️</ThemedText>}
+                              <ThemedText type="smallBold" style={{ color: '#007AFF' }}>{addPaymentRefs.length > 0 ? '+ Tambah Bukti Lain' : '+ Upload dari Galeri'}</ThemedText>
+                            </Pressable>
                           </View>
                         )}
                       </>

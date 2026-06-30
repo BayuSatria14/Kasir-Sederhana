@@ -71,6 +71,20 @@ export default function TabLayout() {
           }}
         />
         <Tabs.Screen
+          name="report"
+          options={{
+            title: 'Laporan',
+            headerShown: false,
+            tabBarIcon: ({ color, size, focused }) => (
+              <Ionicons
+                name={focused ? 'bar-chart' : 'bar-chart-outline'}
+                size={size}
+                color={color}
+              />
+            ),
+          }}
+        />
+        <Tabs.Screen
           name="products"
           options={{
             title: 'Produk',
